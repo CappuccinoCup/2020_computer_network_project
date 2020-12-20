@@ -2,10 +2,7 @@
 #define _PEER_PROCESS_H_
 
 #include "peer_packet.h"
-#include "peer_chunk.h"
-#include "peer_list.h"
-#include "bt_parse.h"
-#include "spiffy.h"
+#include "peer_function.h"
 
 void process_download(char *chunkfile, char *outputfile);
 

@@ -19,121 +19,6 @@ list *peers_GET_pkt_sent;   // all peers this peer has sent GET packet to
 
 list *chunks_to_send;       // all chunks this peer needs to send
 
-
-bt_peer_t* get_peer_by_id(short peer_id) {
-    bt_peer_t *peer;
-    for (peer = config.peers; peer != NULL; peer = peer->next) {
-        if (peer->id == peer_id) {
-            return peer;
-        }
-    }
-    return NULL;
-}
-
-void send_packet(bt_peer_t *peer, void *pkt, int pkt_size) {
-    spiffy_sendto(sock, pkt, pkt_size, 0, (struct sockaddr *)&(peer->addr), sizeof(&(peer->addr)));
-}
-
-void send_GET_pkt(chunk* ck) {
-    // choose an owner peer as target peer to send GET packet
-    list *owners = ck->owner_peers_id;
-    short *target_peer_id = (short *)(malloc(sizeof(short)));
-    bt_peer_t *target_peer;
-    if (peers_GET_pkt_sent == NULL) {
-        peers_GET_pkt_sent = list_init();
-    }
-
-    int available_peer_found = 0;
-    for (int p = 0; p < owners->size; p++) {
-        *target_peer_id = *((short *)(list_get(owners, p)));
-        target_peer = get_peer_by_id(*target_peer_id);
-        if(!target_peer) {
-            printf("WARNING: TARGET PEER NOT FOUND: %d\n", *target_peer_id);
-            chunk_remove_owner(ck, *target_peer_id);
-            free(target_peer_id);
-            p--;
-            continue ;
-        }
-            
-        // check if this peer is downloading from target peer
-        int target_peer_available = 1;
-        int size = peers_GET_pkt_sent->size;
-        for (int i = 0; i < size; i++) {
-            short peer_id = *((short *)(list_get(peers_GET_pkt_sent, i)));
-            if (peer_id == *target_peer_id) {
-                // if so, find next owner peer
-                target_peer_available = 0;
-                break;
-            }
-        }
-        // if not, use this peer
-        if (target_peer_available) {
-            available_peer_found = 1;
-            break;
-        }
-    }
-
-    if (!available_peer_found) {
-        return ;
-    }
-
-    // create GET packet
-    uint8_t hash_binary[CHUNKHASHS_SIZE];
-    hex2binary(ck->sha1, CHUNKHASHS_HEX_SIZE, hash_binary);
-    get_packet* pkt = create_get_pkt(hash_binary);
-
-    // send GET packet
-    send_packet(target_peer, pkt, pkt->header.packet_len);
-
-    // add this peer to peers_GET_pkt_sent
-    if (peers_GET_pkt_sent == NULL) {
-        peers_GET_pkt_sent = list_init();
-    }
-    list_add(peers_GET_pkt_sent, peers_GET_pkt_sent->size, target_peer_id);
-
-    // change the state of this chunk
-    ck->state = DOWNLOADING;
-    ck->from_or_to_id = *target_peer_id;
-
-    // free GET pkt
-    free(pkt);
-}
-
-void send_DATA_pkt() {
-    // send DATA packet for a chunk
-    if (chunks_to_send == NULL || chunks_to_send->size == 0) {
-        return;
-    }
-
-    int size = chunks_to_send->size;
-    chunk *ck;
-    bt_peer_t *target_peer;
-    int i;
-    for (i = 0; i < size; i++) {
-        ck = (chunk *)(list_get(chunks_to_send, i));
-        if ((target_peer = get_peer_by_id(ck->from_or_to_id)) != NULL) {
-            break;
-        } else {
-            list_remove(chunks_to_send, i);
-            i--;
-        }
-    }
-
-    if (target_peer) {
-        window *ww = ck->window;
-        for (int j = 0; j < WINDOW_SIZE; j++) {
-            int next_index = ww->base_index + j * PACKET_MAX_DATA_SIZE;
-            if((ww->wd[j] == 0 || ww->wd[j] == 1) && next_index < BT_CHUNK_SIZE) {
-                u_int seq = (next_index / PACKET_MAX_DATA_SIZE) + 1;
-                data_packet* pkt = create_data_pkt(ck->data + next_index, seq);
-                send_packet(target_peer, pkt, pkt->header.packet_len);
-                free(pkt);
-                ww->wd[j] = 1;
-            }
-        }
-    }
-}
-
 int complete_download() {
     FILE *fp;
     if ((fp = fopen(output_file, "w+")) == NULL) {
@@ -232,7 +117,7 @@ void process_timeout() {
             if (ck->state != FINISHED) {
                 if (ck->state == DOWNLOADING) {
                     bt_peer_t *target_peer = get_peer_by_id(ck->from_or_to_id);
-                    if(target_peer == NULL || ck->reconnect_time > 3) {
+                    if(target_peer == NULL || ck->reconnect_time > 10) {
                         // give up this owner peer
                         ck->reconnect_time = 0;
                         chunk_remove_owner(ck, ck->from_or_to_id);
@@ -246,15 +131,6 @@ void process_timeout() {
                         }
                     } else {
                         ck->reconnect_time++;
-                        // resend ACK packet
-                        u_int ack = ck->window->last_ack_num;
-                        ack_packet *ack_pkt = create_ack_pkt(ack);
-                        send_packet(target_peer, ack_pkt, ack_pkt->header.packet_len);
-                        free(ack_pkt);
-
-                        printf("FOR %s\n", ck->sha1);
-                        printf("RESEND ACK: %d\n", ack);
-
                     }
                 }
                 if (ck->state == WAITING) {
@@ -427,15 +303,28 @@ void process_GET(get_packet *pkt, bt_peer_t *source_peer) {
     // search if hash is in chunks_ihave
     // if so, read this chunk's data send this chunk file
     int have_size = list_size(chunks_ihave);
-    chunk* chunk_p;
+    chunk *chunk_p;
+    chunk *new_ck;
     int i_have_this_chunk = 0;
     for (int i = 0; i < have_size; i++) {
         chunk_p = (chunk *)(list_get(chunks_ihave, i));
         if(memcmp(chunk_p->sha1, hash, CHUNKHASHS_HEX_SIZE) == 0) {
+            new_ck = chunk_init();
+            new_ck->from_or_to_id = source_peer->id;
+            new_ck->id = chunk_p->id;
+            strcpy(new_ck->sha1, chunk_p->sha1);
             i_have_this_chunk = 1;
             break;
         }
     }
+
+    // release chunks in list
+    for(int i = 0; i < have_size; i++) {
+        chunk_p = (chunk *)list_remove(chunks_ihave, 0);
+        chunk_clean(chunk_p);
+    }
+    // release list
+    list_clean(chunks_ihave);
 
     if(i_have_this_chunk) {
         // open chunk-file
@@ -457,22 +346,31 @@ void process_GET(get_packet *pkt, bt_peer_t *source_peer) {
             return ;
         }
         
-        chunk_p->from_or_to_id = source_peer->id;
-
         // read data
-        fseek(fp, chunk_p->id * BT_CHUNK_SIZE, SEEK_SET);
-        if (fread(chunk_p->data, sizeof(uint8_t), BT_CHUNK_SIZE, fp) < 0) {
+        fseek(fp, new_ck->id * BT_CHUNK_SIZE, SEEK_SET);
+        if (fread(new_ck->data, sizeof(uint8_t), BT_CHUNK_SIZE, fp) < 0) {
             printf("ERROR: FILE %s READ FAILED\n", config.chunk_file);
             return ;
         }
 
         fclose(fp);
 
-        // initialize list of chunks to send
+        // initialize list of chunks to send if it is NULL
         if (chunks_to_send == NULL) {
             chunks_to_send = list_init();
         }
-        list_add(chunks_to_send, chunks_to_send->size, chunk_p);
+
+        // if this peer is sending to source peer, then remove last sending chunk
+        int chunks_to_send_size = chunks_to_send->size;
+        for (int index = 0; index < chunks_to_send_size; index++) {
+            chunk *tmp_ck = (chunk *)list_get(chunks_to_send, index);
+            if (tmp_ck->from_or_to_id == source_peer->id) {
+                list_remove(chunks_to_send, index);
+                index--;
+            }
+        }
+
+        list_add(chunks_to_send, chunks_to_send->size, new_ck);
 
         // send DATA packet
         if (chunks_to_send->size == 1) {
@@ -482,23 +380,17 @@ void process_GET(get_packet *pkt, bt_peer_t *source_peer) {
 }
 
 void process_DATA(data_packet *pkt, bt_peer_t *source_peer) {
-    // if not downloading, return
-    if(!downloading) {
-        return ;
-    }
-
     int size = list_size(chunks_to_download);   // how many chunks in chunks_to_download list
     chunk *chunk_p;                             // a chunk pointer
 
     short source_peer_id = source_peer->id;
 
     // check if this peer is downloading from target peer
-    // if not, return
+    // if not, send a fake ack that equal to seq number in the packet
     int GET_sent = 0;
     if (peers_GET_pkt_sent == NULL) {
         peers_GET_pkt_sent = list_init();
     }
-
     int sent_size = peers_GET_pkt_sent->size;
     for (int i = 0; i < sent_size; i++) {
         short peer_id = *((short *)(list_get(peers_GET_pkt_sent, i)));
@@ -508,6 +400,10 @@ void process_DATA(data_packet *pkt, bt_peer_t *source_peer) {
         }
     }
     if (!GET_sent) {
+        u_int fake_ack = pkt->header.seq_num;
+        ack_packet *fake_ack_pkt = create_ack_pkt(fake_ack);
+        send_packet(source_peer, fake_ack_pkt, fake_ack_pkt->header.packet_len);
+        free(fake_ack_pkt);
         return ;
     }
 
@@ -519,9 +415,10 @@ void process_DATA(data_packet *pkt, bt_peer_t *source_peer) {
         }
     }
 
+    // reset reconnect time
     chunk_p->reconnect_time = 0;
     
-    // ckeck sequence number
+    // check sequence number
     u_int seq = pkt->header.seq_num;
     short data_len = pkt->header.packet_len - pkt->header.header_len;
     int seq_expect = chunk_p->window->last_ack_num + 1;
@@ -542,7 +439,6 @@ void process_DATA(data_packet *pkt, bt_peer_t *source_peer) {
     // send ACK packet
     ack_packet *ack_pkt = create_ack_pkt(ack);
     send_packet(source_peer, ack_pkt, ack_pkt->header.packet_len);
-
     free(ack_pkt);
 
     // if this entire chunk has downloaded, check its correctness
@@ -563,9 +459,10 @@ void process_DATA(data_packet *pkt, bt_peer_t *source_peer) {
         }
 
         if(memcmp(chunk_p->sha1, hash, CHUNKHASHS_HEX_SIZE) == 0) {
+            // update chunk state
             chunk_p->state = FINISHED;
 
-            // check if all chunks has finished
+            // check if all chunks has finished, complete download
             chunk *c_p;
             int all_finished = 1;
             for (int i = 0; i < size; i++) {
@@ -621,12 +518,12 @@ void process_ACK(ack_packet *pkt, bt_peer_t *source_peer) {
     // ckeck ack number
     u_int ack = pkt->header.ack_num;
     int ack_expect = (chunk_p->window->base_index / PACKET_MAX_DATA_SIZE) + 1;
-    if (ack >= ack_expect) {
+    if (ack >= ack_expect && ack < ack_expect + WINDOW_SIZE) {
         int step = ack - ack_expect + 1;
         chunk_p->window->base_index += (step * PACKET_MAX_DATA_SIZE);
 
         if (chunk_p->window->base_index == BT_CHUNK_SIZE) {
-            // if sending finished
+            // if sending finished, release resource
             chunk_clean(chunk_p);
             list_remove(chunks_to_send, i);
             send_DATA_pkt();
