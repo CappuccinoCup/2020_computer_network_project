@@ -219,7 +219,7 @@ void process_WHOHAS(whohas_packet *pkt, bt_peer_t *source_peer) {
     ihave_packet *ihave_pkt = create_ihave_pkt(chunks_offer);
 
     // send IHAVE packet to source peer
-    send_packet(source_peer, ihave_pkt, pkt->header.packet_len);
+    send_packet(source_peer, ihave_pkt, ihave_pkt->header.packet_len);
 
     // release IHAVE packet
     free(ihave_pkt);
